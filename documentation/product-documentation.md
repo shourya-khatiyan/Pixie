@@ -283,12 +283,12 @@ Good morning! Here's your day:
 - 2:00 PM: Client presentation
 - 4:00 PM: Code review session
 
-✅ Pending Tasks (3):
+ Pending Tasks (3):
 - Finish API documentation
 - Review pull request #234
 - Update deployment scripts
 
-⚠️ Overdue (1):
+ Overdue (1):
 - Submit expense report (due yesterday)
 ```
 
