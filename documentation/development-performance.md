@@ -162,6 +162,186 @@ def invalidate_user_cache(user_id: str):
 
 ---
 
+## Semantic Cache Complete Implementation
+
+### Full Workflow
+
+```python
+import redis
+import numpy as np
+from typing import Optional, Dict
+
+class SemanticCache:
+    def __init__(self, redis_client, similarity_threshold=0.95):
+        self.redis = redis_client
+        self.threshold = similarity_threshold
+    
+    async def get(self, user_id: str, query_embedding: list) -> Optional[Dict]:
+        """Check cache for semantically similar query"""
+        # Get all cached queries for this user
+        cache_keys = self.redis.keys(f"semantic_cache:{user_id}:*")
+        
+        if not cache_keys:
+            return None
+        
+        # Find most similar cached query
+        best_match = None
+        best_similarity = 0
+        
+        for key in cache_keys:
+            cached_data = self.redis.get(key)
+            if not cached_data:
+                continue
+            
+            cached = json.loads(cached_data)
+            cached_embedding = cached["query_embedding"]
+            
+            # Calculate cosine similarity
+            similarity = self._cosine_similarity(query_embedding, cached_embedding)
+            
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = cached
+        
+        # Return if similarity above threshold
+        if best_similarity >= self.threshold:
+            logger.info(f"Cache hit", extra={
+                "user_id": user_id,
+                "similarity": best_similarity
+            })
+            return best_match["response"]
+        
+        return None
+    
+    async def set(self, user_id: str, query: str, query_embedding: list, 
+                  response: Dict, ttl: int = 3600):
+        """Store query-response pair in cache"""
+        cache_key = f"semantic_cache:{user_id}:{hash(query)}"
+        
+        cache_data = {
+            " query": query,
+            "query_embedding": query_embedding,
+            "response": response,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        self.redis.setex(
+            cache_key,
+            ttl,
+            json.dumps(cache_data)
+        )
+        
+        logger.info(f"Cache set", extra={"user_id": user_id, "ttl": ttl})
+    
+    @staticmethod
+    def _cosine_similarity(a: list, b: list) -> float:
+        """Calculate cosine similarity between two vectors"""
+        a = np.array(a)
+        b = np.array(b)
+        return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+```
+
+### Integration with LLM Processing
+
+```python
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+semantic_cache = SemanticCache(redis_client, similarity_threshold=0.95)
+
+async def process_query(user_id: str, query: str):
+    """Process query with semantic caching"""
+    # 1. Generate embedding
+    query_embedding = await generate_embedding(query)
+    
+    # 2. Check semantic cache
+    cached_response = await semantic_cache.get(user_id, query_embedding)
+    
+    if cached_response:
+        # Cache hit - return immediately
+        return {
+            "response": cached_response["text"],
+            "tool_calls": cached_response.get("tool_calls", []),
+            "source": "cache"
+        }
+    
+    # 3. Cache miss - generate LLM response
+    response = await llm.generate(
+        user_id=user_id,
+        query=query,
+        context=await fetch_context(user_id, query)
+    )
+    
+    # 4. Cache for future
+    await semantic_cache.set(
+        user_id=user_id,
+        query=query,
+        query_embedding=query_embedding,
+        response=response,
+        ttl=3600  # 1 hour
+    )
+    
+    return response
+```
+
+### Cache Monitoring
+
+**Track Cache Performance:**
+```python
+from prometheus_client import Counter, Histogram
+
+cache_hits = Counter('semantic_cache_hits_total', 'Total cache hits')
+cache_misses = Counter('semantic_cache_misses_total', 'Total cache misses')
+cache_latency = Histogram('semantic_cache_latency_seconds', 'Cache lookup latency')
+
+class MonitoredSemanticCache(SemanticCache):
+    async def get(self, user_id: str, query_embedding: list) -> Optional[Dict]:
+        start = time.time()
+        
+        result = await super().get(user_id, query_embedding)
+        
+        # Record metrics
+        cache_latency.observe(time.time() - start)
+        
+        if result:
+            cache_hits.inc()
+        else:
+            cache_misses.inc()
+        
+        return result
+```
+
+**Calculate Cache Hit Rate:**
+```python
+async def get_cache_stats():
+    """Get cache performance statistics"""
+    hits = cache_hits._value.get()
+    misses = cache_misses._value.get()
+    total = hits + misses
+    
+    if total == 0:
+        return {"hit_rate": 0, "total_requests": 0}
+    
+    hit_rate = hits / total
+    
+    return {
+        "hit_rate": hit_rate,
+        "total_requests": total,
+        "hits": hits,
+        "misses": misses,
+        "avg_latency_ms": cache_latency._sum.get() / cache_latency._count.get() * 1000
+    }
+
+# Daily report
+async def daily_cache_report():
+    stats = await get_cache_stats()
+    logger.info("Daily cache report", extra=stats)
+    
+    # Alert if hit rate too low
+    if stats["hit_rate"] < 0.2:  # Below 20%
+        await alert_ops("Cache hit rate below threshold", stats)
+```
+
+---
+
 ## Performance Benchmarks
 
 ### Latency Targets
@@ -320,7 +500,7 @@ collection_config = {
     ),
     "hnsw_config": HnswConfigDiff(
         m=16,  # connections per node (8-64 range)
-        ef_construct=100,  # construction quality
+        ef_construct=128,  # construction quality (STANDARD)
         max_indexing_threads=0  # auto-detect CPU cores
     )
 }

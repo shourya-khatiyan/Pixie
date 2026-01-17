@@ -409,6 +409,226 @@ First retry: Re-send with schema + error message
 
 ---
 
+## 8. Complete Service Failure Scenarios
+
+### All LLM Providers Down
+
+**Worst Case:** OpenAI AND Anthropic both unavailable
+
+**Detection:**
+```python
+async def check_all_providers_health():
+    providers_status = {
+        "openai": await check_openai_health(),
+        "anthropic": await check_anthropic_health()
+    }
+    
+    all_down = all(not status for status in providers_status.values())
+    
+    if all_down:
+        logger.critical("ALL LLM PROVIDERS DOWN", extra=providers_status)
+        return False
+    
+    return True
+```
+
+**Fallback Strategy:**
+
+**1. Semantic Cache Fallback**
+```python
+async def handle_complete_llm_failure(user_id, query):
+    # Try semantic cache first
+    query_embedding = await get_embedding(query)  # This might still work
+    cached_response = await semantic_cache.get_similar(user_id, query_embedding, threshold=0.85)
+    
+    if cached_response:
+        logger.info("Served from cache during LLM outage")
+        return {
+            "response": cached_response["response"],
+            "source": "cache",
+            "note": "AI temporarily unavailable, showing similar previous response"
+        }
+    
+    # No cache match - use static fallback
+    return get_static_fallback_response(query)
+```
+
+**2. Static Fallback Response**
+```python
+def get_static_fallback_response(query):
+    """Pattern-match common queries to static responses"""
+    query_lower = query.lower()
+    
+    if any(word in query_lower for word in ["task", "todo"]):
+        return {
+            "response": "I'm temporarily unavailable. You can manually create tasks using the form above.",
+            "fallback_ui": "task_creation_form"
+        }
+    
+    if any(word in query_lower for word in ["event", "meeting", "calendar"]):
+        return {
+            "response": "I'm temporarily unavailable. You can manually add events to your calendar.",
+            "fallback_ui": "calendar_view"
+        }
+    
+    # Generic fallback
+    return {
+        "response": "I'm temporarily unavailable due to high demand. Your request has been saved and I'll process it when service resumes. In the meantime, you can use the manual tools above.",
+        "fallback_ui": "manual_mode"
+    }
+```
+
+**3. Request Queuing**
+```python
+import redis
+
+async def queue_for_later_processing(user_id, query, context):
+    """Store request for processing when service recovers"""
+    request_data = {
+        "user_id": user_id,
+        "query": query,
+        "context": context,
+        "timestamp": datetime.now().isoformat(),
+        "retry_count": 0
+    }
+    
+    # Store in Redis list
+    await redis_client.lpush("queued_requests", json.dumps(request_data))
+    
+    logger.info("Request queued for later", extra={"user_id": user_id})
+    
+    return {
+        "queued": True,
+        "message": "Your request is saved. We'll notify you when it's processed."
+    }
+```
+
+**4. Background Queue Processor**
+```python
+async def process_queued_requests():
+    """Run every 5 minutes to process queued requests"""
+    while True:
+        try:
+            # Check if services are back up
+            if not await check_all_providers_health():
+                await asyncio.sleep(300)  # Wait 5 minutes
+                continue
+            
+            # Process queue
+            while True:
+                request_json = await redis_client.rpop("queued_requests")
+                if not request_json:
+                    break
+                
+                request = json.loads(request_json)
+                
+                try:
+                    # Process the queued request
+                    response = await process_llm_query(
+                        user_id=request["user_id"],
+                        query=request["query"],
+                        context=request["context"]
+                    )
+                    
+                    # Notify user
+                    await notify_user(request["user_id"], response)
+                    
+                except Exception as e:
+                    # Re-queue if still failing
+                    request["retry_count"] += 1
+                    if request["retry_count"] < 3:
+                        await redis_client.lpush("queued_requests", json.dumps(request))
+                    else:
+                        logger.error("Failed to process queued request after 3 retries")
+        
+        except Exception as e:
+            logger.error("Queue processor error", extra={"error": str(e)})
+        
+        await asyncio.sleep(300)  # Check every 5 minutes
+```
+
+### Cross-Service Idempotency
+
+**Problem:** Node.js retries Python call, causing duplicate operations
+
+**Example:**
+- Node.js calls Python to generate task via LLM
+- Python generates response with `create_task` tool call
+- Node.js timeout occurs before receiving response
+- Node.js retries → Python processes again → Duplicate task created
+
+**Solution: Request ID Deduplication**
+
+**Node.js Implementation:**
+```javascript
+const { v4: uuidv4 } = require('uuid');
+
+async function callPythonWithIdempotency(endpoint, data) {
+  // Generate unique request ID
+  const requestId = uuidv4();
+  
+  const response = await fetch(`${PYTHON_AI_URL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Request-ID': requestId,  // Include in header
+      'Authorization': `Bearer ${INTERNAL_API_KEY}`
+    },
+    body: JSON.stringify({ ...data, request_id: requestId })
+  });
+  
+  return response.json();
+}
+```
+
+**Python Implementation:**
+```python
+import redis
+from fastapi import Header, HTTPException
+
+redis_client = redis.Redis(host='localhost', port=6379, db=0)
+
+@app.post("/api/generate")
+async def generate(
+    request: GenerateRequest,
+    x_request_id: str = Header(None)
+):
+    if not x_request_id:
+        raise HTTPException(400, "Missing X-Request-ID header")
+    
+    # Check if we've already processed this request
+    cache_key = f"request:{x_request_id}"
+    cached_response = redis_client.get(cache_key)
+    
+    if cached_response:
+        logger.info("Returning cached response for duplicate request",
+                   extra={"request_id": x_request_id})
+        return json.loads(cached_response)
+    
+    # Process request
+    response = await process_llm_query(
+        user_id=request.user_id,
+        query=request.query
+    )
+    
+    # Cache response for 5 minutes (prevents duplicates)
+    redis_client.setex(
+        cache_key,
+        300,  # 5 minutes
+        json.dumps(response)
+    )
+    
+    return response
+```
+
+**Benefits:**
+- Retry-safe: Same request_id returns same response
+- Prevents duplicate tool executions
+- 5-minute window handles typical retry scenarios
+- Automatic cleanup (Redis TTL)
+
+---
+
 ## 9. Production Recommendations
 
 ### Configuration Values (Recommended)

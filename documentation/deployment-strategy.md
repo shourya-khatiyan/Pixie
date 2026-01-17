@@ -35,103 +35,197 @@ User Request → Node.js → Python AI Service → Node.js → User Response
 
 ---
 
-## 2. Hosting Platform Comparison
+## 2. Recommended MVP Deployment: Railway
 
-### Railway (Recommended for MVP)
+### Why Railway for MVP
 
-**Pros:**
-- Easiest deployment (Git push to deploy)
-- Automatic SSL/TLS certificates
-- Built-in PostgreSQL, Redis
-- Affordable for MVP ($5-20/month)
-- Good for both Python and Node.js
-- Automatic environment variables management
+**Strongly Recommended for Pixie MVP Launch**
 
-**Cons:**
-- Limited customization vs cloud providers
-- Smaller community than AWS/GCP
-- May need migration for large scale
+Railway is the ideal choice for your initial deployment:
 
-**Best For:** Quick MVP deployment, small teams, budget-conscious projects
+✅ **Simplicity:** Git push to deploy - no complex configuration
+✅ **Cost:** $5-20/month for MVP scale (vs $50-200 on AWS)
+✅ **Speed:** Deploy in 5 minutes vs hours on cloud providers
+✅ **Services:** Built-in PostgreSQL, Redis, monitoring
+✅ **SSL:** Automatic HTTPS certificates
+✅ **Both Stacks:** Python AND Node.js supported equally well
 
-### AWS (Elastic Container Service / App Runner)
+**Perfect For:**
+- MVP launch and early validation
+- Small teams without DevOps expertise
+- Fast iteration and testing
+- Budget-conscious projects
 
-**Pros:**
-- Highly scalable
-- Extensive services (RDS, ElastiCache, S3)
-- Enterprise-grade security
-- Mature ecosystem
-- Good for long-term growth
+**When to Migrate:**
+- After reaching ~50K+ users
+- When needing advanced AWS/GCP services
+- Enterprise compliance requirements
+- Multi-region deployment needs
 
-**Cons:**
-- Steeper learning curve
-- More complex setup
-- Higher costs for small projects
-- Requires more DevOps knowledge
+### Railway Deployment Steps
 
-**Best For:** Production apps with growth plans, enterprise requirements
+**1. Install Railway CLI:**
+```bash
+npm install -g @railway/cli
+railway login
+```
 
-### GCP (Cloud Run / App Engine)
+**2. Initialize Project:**
+```bash
+# In your Python AI service directory
+railway init
 
-**Pros:**
-- Serverless options (Cloud Run)
-- Pay-per-use pricing
-- Good integration with AI/ML services
-- Simpler than AWS
-- Automatic scaling
+# Link to GitHub repo
+railway link
+```
 
-**Cons:**
-- Smaller ecosystem than AWS
-- Less vendor support
-- Cold start issues with Cloud Run
+**3. Configure Services:**
+```bash
+# Add PostgreSQL (for Node.js backend)
+railway add --database postgresql
 
-**Best For:** Serverless workloads, AI/ML heavy applications
+# Add Redis (for caching)
+railway add --database redis
 
-### Vercel (Not Recommended for Python Backend)
+# Note: Qdrant should be deployed separately or use Qdrant Cloud
+```
 
-**Pros:**
-- Excellent for Next.js/frontend
-- Serverless functions
-- Global CDN
+**4. Set Environment Variables:**
+```bash
+# Set via CLI
+railway variables set OPENAI_API_KEY=sk-...
+railway variables set ANTHROPIC_API_KEY=sk-ant-...
+railway variables set QDRANT_HOST=your-qdrant-instance.com
 
-**Cons:**
-- Python support limited to serverless functions
-- Not ideal for long-running AI processes
-- Better for frontend hosting
+# Or use Railway dashboard (recommended for sensitive data)
+```
 
-**Best For:** Frontend only, not backend services
+**5. Deploy:**
+```bash
+# Automatic deployment from GitHub
+git push origin main
 
-### DigitalOcean / Linode
+# Railway automatically:
+# - Detects Dockerfile
+# - Builds image
+# - Deploys to production
+# - Issues SSL certificate
+# - Provides public URL
 
-**Pros:**
-- Simple VPS hosting
-- Predictable pricing
-- Good documentation
-- Full control
+# Manual deployment
+railway up
+```
 
-**Cons:**
-- Manual server management
-- Need to configure everything
-- No managed services
+**6. Get Service URL:**
+```bash
+railway status
+# Returns: https://python-ai-production.up.railway.app
+```
 
-**Best For:** Teams wanting full control, comfortable with server management
+**7. Configure Node.js to Call Python Service:**
+```javascript
+// In Node.js backend .env
+PYTHON_AI_URL=https://python-ai-production.up.railway.app
 
-### Recommendation for Pixie
+// Or use Railway's internal networking (private)
+PYTHON_AI_URL=http://python-ai.railway.internal:8000
+```
 
-**MVP:** Railway (both services)
-- Simplest setup
-- Deploy both Python and Node.js easily
-- Automdatic SSL
-- Low cost
+### Railway Configuration File
 
-**Production:** AWS ECS or GCP Cloud Run
-- Better scaling
-- More services available
-- Professional-grade infrastructure
+Create `railway.json` in project root:
+
+```json
+{
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "sleepApplication": false,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  }
+}
+```
+
+### Qdrant Deployment Options
+
+**Option 1: Qdrant Cloud (Recommended)**
+- Managed service: https://cloud.qdrant.io
+- Free tier available
+- Automatic backups
+- No maintenance
+
+**Option 2: Railway Deployment**
+- Deploy Qdrant as separate Railway service
+- Use official Docker image: `qdrant/qdrant`
+- Add persistent volume for data
+
+```bash
+# Deploy Qdrant on Railway
+railway run qdrant/qdrant
+
+# Get internal URL
+railway variables set QDRANT_HOST=qdrant.railway.internal
+railway variables set QDRANT_PORT=6333
+```
+
+### Cost Estimate (Railway)
+
+**Monthly Cost Breakdown:**
+- Python AI Service: $5-10 (512MB-1GB RAM)
+- Node.js Backend: $5-10 (managed by other dev)
+- PostgreSQL: $5 (Railway managed)
+- Redis: $5 (Railway managed)
+- Qdrant (if on Railway): $10
+- **Total: ~$30-40/month for full stack**
+
+**Scales with usage - only pay for what you use**
 
 ---
 
-## 3. Docker Containerization
+## 3. Alternative Platforms (Post-MVP)
+
+### When Railway Isn't Enough
+
+Consider migration when:
+- User base > 50K active users
+- Need multi-region deployment
+- Require enterprise SLAs
+- Advanced networking/security requirements
+
+### AWS (Production Scale)
+
+**Best For:** Enterprise production
+
+**Setup Complexity:** High (1-2 weeks)
+
+**Cost:** $100-500/month
+
+**Services:**
+- ECS Fargate (containers)
+- RDS PostgreSQL
+- ElastiCache Redis
+- Application Load Balancer
+
+### GCP Cloud Run
+
+**Best For:** Serverless workloads
+
+**Setup Complexity:** Medium (2-3 days)
+
+**Cost:** Pay-per-use ($50-200/month typical)
+
+**Benefits:**
+- Automatic scaling to zero
+- Good for variable traffic
+- AI/ML service integration
+
+---
+
+## 4. Docker Containerization
 
 ### Why Docker for Python AI Service
 
@@ -812,7 +906,124 @@ Your architecture:
 
 ---
 
-## 12. Best Practices Summary
+## 12. Database Backups
+
+### PostgreSQL Backups (Node.js Responsibility)
+
+**Railway Automatic Backups:**
+- Daily automated backups (last 7 days)
+- Point-in-time recovery
+- One-click restore from dashboard
+
+**Manual Backup:**
+```bash
+# Backup from Railway
+railway run pg_dump > backup_$(date +%Y%m%d).sql
+
+# Restore
+railway run psql < backup_20260117.sql
+```
+
+### Qdrant Backups (Your Responsibility)
+
+**Daily Snapshot Script:**
+
+```python
+import schedule
+from qdrant_client import QdrantClient
+import boto3  # For S3 upload
+from datetime import datetime
+
+client = QdrantClient(host=QDRANT_HOST, port=6333)
+
+async def backup_qdrant():
+    """Create and upload Qdrant snapshot"""
+    try:
+        # Create snapshot
+        snapshot_info = client.create_snapshot(
+            collection_name="user_documents"
+        )
+        
+        # Download snapshot
+        snapshot_path = f"./backups/qdrant_{datetime.now().strftime('%Y%m%d')}.snapshot"
+        client.download_snapshot(
+            collection_name="user_documents",
+            snapshot_name=snapshot_info.name,
+            output_path=snapshot_path
+        )
+        
+        # Upload to S3 (or other cloud storage)
+        s3 = boto3.client('s3')
+        s3.upload_file(
+            snapshot_path,
+            'pixie-backups',
+            f "qdrant/{snapshot_info.name}"
+        )
+        
+        logger.info(f"Qdrant backup completed: {snapshot_info.name}")
+        
+        # Cleanup old local backups
+        cleanup_old_backups(days=7)
+        
+    except Exception as e:
+        logger.error(f"Qdrant backup failed: {e}")
+        await alert_ops_team("Qdrant backup failure", str(e))
+
+# Run daily at 2 AM
+schedule.every().day.at("02:00").do(backup_qdrant)
+```
+
+**Restore from Snapshot:**
+
+```python
+async def restore_qdrant_snapshot(snapshot_name):
+    """Restore Qdrant from backup"""
+    # Download from S3
+    s3 = boto3.client('s3')
+    local_path = f"./restore/{snapshot_name}"
+    s3.download_file(
+        'pixie-backups',
+        f"qdrant/{snapshot_name}",
+        local_path
+    )
+    
+    # Restore to Qdrant
+    client.recover_snapshot(
+        collection_name="user_documents",
+        snapshot_path=local_path
+    )
+    
+    logger.info(f"Qdrant restored from {snapshot_name}")
+```
+
+### Backup Schedule
+
+**Recommended:**
+- **Daily:** Automated snapshots
+- **Weekly:** Full backup to cloud storage (S3, GCS)
+- **Monthly:** Archive for compliance (if needed)
+- **Pre-Migration:** Manual backup before any schema changes
+
+**Retention Policy:**
+- Daily backups: 7 days
+- Weekly backups: 4 weeks
+- Monthly backups: 12 months
+
+### Disaster Recovery Plan
+
+**RTO (Recovery Time Objective):** 1 hour
+**RPO (Recovery Point Objective):** 24 hours
+
+**Recovery Steps:**
+1. Deploy new Qdrant instance
+2. Restore from latest snapshot (< 5 minutes)
+3. Update environment variables with new Qdrant URL
+4. Restart Python AI service
+5. Verify search functionality
+
+---
+
+## 13. Best Practices Summary
 
 **Integration:**
 - Clear API contract between services

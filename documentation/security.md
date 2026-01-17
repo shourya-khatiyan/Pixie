@@ -446,6 +446,247 @@ pip-audit
 
 ---
 
+## Security Incident Response
+
+### Compromised API Key
+
+**Detection:**
+- Unusual API usage patterns
+- API calls from unexpected locations
+- Spike in error rates (invalid requests)
+- GitHub commit scanner alerts
+- Public leak reported
+
+**Immediate Response (< 1 hour):**
+
+1. **Rotate ALL affected keys immediately**
+```bash
+# Generate new keys
+export NEW_OPENAI_KEY=$(generate_new_key)
+export NEW_ANTHROPIC_KEY=$(generate_new_key)
+
+# Update in all environments
+kubectl set env deployment/python-ai OPENAI_API_KEY=$NEW_OPENAI_KEY
+railway env set OPENAI_API_KEY=$NEW_OPENAI_KEY
+
+# Revoke old keys in provider dashboards
+```
+
+2. **Audit recent API usage**
+```python
+async def audit_api_usage(since_timestamp):
+    """Check for suspicious activity"""
+    logs = await get_api_logs(since=since_timestamp)
+    
+    suspicious = []
+    for log in logs:
+        if log["ip"] not in KNOWN_IPS:
+            suspicious.append(log)
+        if log["user_agent"] != EXPECTED_UA:
+            suspicious.append(log)
+        if log["tokens_used"] > NORMAL_THRESHOLD * 10:
+            suspicious.append(log)
+    
+    return suspicious
+```
+
+3. **Lock affected user accounts (if user-specific breach)**
+```python
+async def lock_compromised_accounts(user_ids):
+    for user_id in user_ids:
+        await db.update_user(user_id, {"account_status": "locked"})
+        await send_security_notification(user_id)
+```
+
+4. **Notify stakeholders**
+- Engineering team (Slack alert)
+- Security team
+- Affected users (within 24 hours)
+
+**Post-Incident (< 24 hours):**
+- Document what happened
+- Calculate unauthorized usage cost
+- Update security procedures
+- Add detection for similar patterns
+
+### DDoS Attack
+
+**Detection:**
+- Sudden traffic spike (10x normal)
+- High rate of requests from few IPs
+- Service degradation/timeouts
+- Elevated error rates
+
+**Mitigation Layers:**
+
+**1. Rate Limiting (Already Implemented)**
+```python
+# Per-IP rate limiting
+IP_RATE_LIMIT = (100, 60)  # 100 requests per minute
+
+async def check_ip_rate_limit(request):
+    client_ip = request.client.host
+    
+    # Track requests per IP
+    key = f"ip_limit:{client_ip}"
+    current = int(redis_client.get(key) or 0)
+    
+    if current >= IP_RATE_LIMIT[0]:
+        raise HTTPException(429, "Too many requests from this IP")
+    
+    redis_client.incr(key)
+    redis_client.expire(key, IP_RATE_LIMIT[1])
+```
+
+**2. CloudFlare/Railway Protection (Automatic)**
+- Railway provides DDoS protection automatically
+- CloudFlare (if using) has additional layer
+- Enable "Under Attack" mode if needed
+
+**3. Temporary Restrictions**
+```python
+DDOS_MODE_ACTIVE = False
+
+async def enable_ddos_protection():
+    global DDOS_MODE_ACTIVE
+    DDOS_MODE_ACTIVE = True
+    
+    # Stricter rate limits
+    USER_RATE_LIMIT = (10, 60)  # Reduce to 10 req/min
+    IP_RATE_LIMIT = (50, 60)    # Reduce to 50 req/min
+    
+    logger.critical("DDoS protection enabled")
+
+@app. middleware("http")
+async def ddos_protection_middleware(request, call_next):
+    if DDOS_MODE_ACTIVE:
+        # Require authentication for ALL endpoints
+        if not request.headers.get("Authorization"):
+            return JSONResponse(
+                {"error": "Authentication required"},
+                status_code=401
+            )
+        
+        # Additional verification
+        await verify_request_signature(request)
+    
+    return await call_next(request)
+```
+
+**4. IP Whitelisting (Emergency)**
+```python
+ALLOWED_IPS = [
+    "node-backend-ip",
+    "staging-server-ip",
+    "admin-office-ip"
+]
+
+async def emergency_whitelist_mode(request):
+    """Only allow known IPs during severe attack"""
+    if request.client.host not in ALLOWED_IPS:
+        raise HTTPException(403, "Service temporarily restricted")
+```
+
+**5. Scaling Response**
+- Horizontal scaling (add instances)
+- If legitimate traffic spike: scale up
+- If attack: enable protections and maintain minimal service
+
+**Recovery:**
+```python
+async def disable_ddos_mode():
+    global DDOS_MODE_ACTIVE
+    DDOS_MODE_ACTIVE = False
+    
+    # Restore normal rate limits
+    USER_RATE_LIMIT = (100, 3600)
+    IP_RATE_LIMIT = (100, 60)
+    
+    logger.info("DDoS protection disabled - service normal")
+```
+
+### Data Breach (User Data Exposed)
+
+**Immediate Actions:**
+1. Isolate affected systems
+2. Determine scope (which users, what data)
+3. Preserve evidence logs
+4. Notify security team and legal
+
+**User Notification (Required by Law):**
+- Within 72 hours of discovery (GDPR)
+- Explain what data was exposed
+- What actions users should take
+- What company is doing to prevent recurrence
+
+**Template:**
+```
+Subject: Important Security Notice
+
+We detected unauthorized access to a limited portion of our systems on [DATE]. 
+
+What happened:
+- [Brief description]
+
+What data was affected:
+- [Specific data types]
+
+What we're doing:
+- [Security measures]
+
+What you should do:
+- [User actions if any]
+
+We take security seriously and have implemented additional measures to prevent this from happening again.
+```
+
+### Malicious Document Ingestion
+
+**Scenario:** User uploads document containing prompt injection or malicious content
+
+**Detection:**
+```python
+def scan_document_for_threats(content):
+    """Screen user-uploaded content"""
+    threats = []
+    
+    # Check for prompt injection patterns
+    if detect_prompt_injection(content):
+        threats.append("prompt_injection")
+    
+    # Check for excessive special characters
+    special_char_ratio = len(re.findall(r'[^a-zA-Z0-9\s]', content)) / len(content)
+    if special_char_ratio > 0.3:
+        threats.append("suspicious_encoding")
+    
+    # Check for embedded scripts
+    if re.search(r'<script|javascript:|onerror=', content, re.I):
+        threats.append("script_injection")
+    
+    return threats
+```
+
+**Response:**
+```python
+async def ingest_with_screening(user_id, content):
+    threats = scan_document_for_threats(content)
+    
+    if threats:
+        logger.warning("Malicious content detected",
+                      extra={"user_id": user_id, "threats": threats})
+        
+        # Block ingestion
+        return {
+            "success": False,
+            "error": "Content failed security screening"
+        }
+    
+    # Safe to ingest
+    return await ingest_document(user_id, content)
+```
+
+---
+
 ## Implementation Checklist
 
 ### Critical (Immediate)

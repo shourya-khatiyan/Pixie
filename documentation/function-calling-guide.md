@@ -599,6 +599,177 @@ result = await taskService.createTask(userId, {
 
 ---
 
+## Tool Authorization & Security
+
+### Per-Tool Permissions
+
+**Not all users should access all tools**
+
+**Permission Structure:**
+```python
+TOOL_PERMISSIONS = {
+    "create_task": {"min_role": "user", "requires_ownership": False},
+    "update_task": {"min_role": "user", "requires_ownership": True},
+    "delete_task": {"min_role": "user", "requires_ownership": True},
+    "create_event": {"min_role": "user", "requires_ownership": False},
+    "search_context": {"min_role": "user", "requires_ownership": False},
+    "admin_override": {"min_role": "admin", "requires_ownership": False}
+}
+```
+
+**Authorization Check:**
+```python
+from functools import wraps
+
+def require_authorization(tool_name):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(user_id, user_role, **kwargs):
+            permissions = TOOL_PERMISSIONS.get(tool_name)
+            
+            # Check role requirement
+            if user_role not in get_roles_at_or_above(permissions["min_role"]):
+                raise UnauthorizedError(f"User lacks permission for {tool_name}")
+            
+            # Check ownership for modification tools
+            if permissions.get("requires_ownership"):
+                resource_id = kwargs.get("task_id") or kwargs.get("event_id")
+                if not user_owns_resource(user_id, resource_id):
+                    raise UnauthorizedError(f"User does not own resource {resource_id}")
+            
+            return await func(user_id=user_id, **kwargs)
+        return wrapper
+    return decorator
+
+@require_authorization("delete_task")
+async def delete_task_handler(user_id, task_id):
+    # Only reaches here if authorized
+    await db.delete_task(task_id)
+    return {"success": True}
+```
+
+**LLM Tool Call Validation:**
+```python
+async def execute_tool_calls(user_id, user_role, tool_calls):
+    results = []
+    
+    for tool_call in tool_calls:
+        tool_name = tool_call["name"]
+        params = tool_call["arguments"]
+        
+        # Validate authorization BEFORE executing
+        try:
+            await check_tool_authorization(user_id, user_role, tool_name, params)
+        except UnauthorizedError as e:
+            results.append({
+                "tool": tool_name,
+                "success": False,
+                "error": str(e)
+            })
+            continue
+        
+        # Execute if authorized
+        result = await execute_single_tool(tool_name, params)
+        results.append(result)
+    
+    return results
+```
+
+### Tool Execution Limits
+
+**Timeout Per Tool:**
+```python
+import asyncio
+
+TOOL_TIMEOUTS = {
+    "create_task": 5,  # 5 seconds
+    "search_context": 10,  # Vector search can be slower
+    "send_email": 15,  # External API
+    "default": 10
+}
+
+async def execute_with_timeout(tool_name, params):
+    timeout = TOOL_TIMEOUTS.get(tool_name, TOOL_TIMEOUTS["default"])
+    
+    try:
+        result = await asyncio.wait_for(
+            execute_tool(tool_name, params),
+            timeout=timeout
+        )
+        return result
+    except asyncio.TimeoutError:
+        logger.error(f"Tool timeout: {tool_name}", extra={"params": params})
+        return {
+            "success": False,
+            "error": f"Tool execution exceeded {timeout}s timeout"
+        }
+```
+
+**Concurrent Tool Limit:**
+```python
+MAX_CONCURRENT_TOOLS = 3
+
+async def execute_tool_calls_with_limit(tool_calls):
+    if len(tool_calls) > MAX_CONCURRENT_TOOLS:
+        logger.warning(f"Too many concurrent tools: {len(tool_calls)}")
+        # Execute in batches
+        results = []
+        for i in range(0, len(tool_calls), MAX_CONCURRENT_TOOLS):
+            batch = tool_calls[i:i+MAX_CONCURRENT_TOOLS]
+            batch_results = await asyncio.gather(*[
+                execute_with_timeout(tc["name"], tc["arguments"]) 
+                for tc in batch
+            ])
+            results.extend(batch_results)
+        return results
+    
+    # Execute all in parallel
+    return await asyncio.gather(*[
+        execute_with_timeout(tc["name"], tc["arguments"]) 
+        for tc in tool_calls
+    ])
+```
+
+### Rate Limiting Per Tool
+
+**Prevent tool abuse:**
+```python
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+class ToolRateLimiter:
+    def __init__(self):
+        self.limits = {
+            "create_task": (50, 3600),  # 50 per hour
+            "delete_task": (20, 3600),  # 20 per hour
+            "search_context": (100, 3600)  # 100 per hour
+        }
+        self.usage = defaultdict(list)
+    
+    def check_limit(self, user_id, tool_name):
+        if tool_name not in self.limits:
+            return True  # No limit for this tool
+        
+        max_calls, window_seconds = self.limits[tool_name]
+        key = f"{user_id}:{tool_name}"
+        
+        # Clean old timestamps
+        cutoff = datetime.now() - timedelta(seconds=window_seconds)
+        self.usage[key] = [
+            ts for ts in self.usage[key] if ts > cutoff
+        ]
+        
+        # Check limit
+        if len(self.usage[key]) >= max_calls:
+            return False
+        
+        # Record this call
+        self.usage[key].append(datetime.now())
+        return True
+```
+
+---
+
 ## Best Practices
 
 ### 1. Clear Tool Descriptions

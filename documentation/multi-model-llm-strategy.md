@@ -192,6 +192,156 @@ At 10,000 users:
 
 ---
 
+## Model Selection Edge Cases
+
+### Misrouted Queries
+
+**Problem:** Complexity estimation puts query in wrong model tier
+
+**Example:**
+- User: "Schedule meeting with John tomorrow at 3pm"
+- Estimated complexity: 2 (simple) → GPT-4o mini
+- But user meant: "Find optimal time considering my calendar and John's availability"
+- Actual complexity: 8 (complex reasoning)
+
+**Solution:**
+```python
+def handle_poor_response(user_feedback, query, response):
+    """
+    Allow user to request better model retry
+    """
+    if user_feedback == "not_helpful":
+        # Log for analysis
+        logger.info("Query misrouted", extra={
+            "query": query,
+            "original_model": "gpt-4o-mini",
+            "complexity_score": estimate_complexity(query)
+        })
+        
+        # Retry with upgraded model
+        return await generate_with_model(
+            query=query,
+            model="gpt-4o",  # Force better model
+            context={"retry_reason": "user_requested_better_quality"}
+        )
+```
+
+**User Interface:**
+- Add "Try with advanced AI" button after response
+- Track retry rate to improve complexity estimation
+- Adjust thresholds monthly based on misroute data
+
+### Budget Exceeded
+
+**Monitoring Daily Spend:**
+```python
+import redis
+from datetime import datetime
+
+class BudgetMonitor:
+    def __init__(self, redis_client, daily_limit_usd=100):
+        self.redis = redis_client
+        self.daily_limit = daily_limit_usd
+    
+    def record_cost(self, cost_usd, model):
+        """Track spend per day"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        key = f"spend:{today}"
+        
+        # Increment daily spend
+        current = float(self.redis.get(key) or 0)
+        new_total = current + cost_usd
+        self.redis.setex(key, 86400, new_total)  # 24 hour expiry
+        
+        # Check if approaching or exceeded limit
+        if new_total >= self.daily_limit * 0.8:  # 80% threshold
+            self.alert_approaching_limit(new_total)
+        
+        if new_total >= self.daily_limit:
+            self.enable_budget_mode()
+        
+        return new_total
+    
+    def enable_budget_mode(self):
+        """Switch to cost-saving mode"""
+        logger.critical("Daily budget exceeded - enabling budget mode")
+        self.redis.set("budget_mode", "true", ex=86400)
+```
+
+**Budget Mode Behavior:**
+```python
+def select_model_with_budget_check(complexity):
+    """
+    Adjust model selection when budget constrained
+    """
+    if budget_monitor.is_budget_mode_active():
+        # Force cheapest model for all queries
+        return "gpt-4o-mini"
+    
+    # Normal routing
+    if complexity <= 3:
+        return "gpt-4o-mini"
+    elif complexity <= 7:
+        return "claude-3-5-haiku"
+    else:
+        return "gpt-4o"
+```
+
+**User Communication:**
+- "We're experiencing high demand. Responses may be simpler than usual."
+- Don't tell users about budget issues directly
+- Maintain functionality, just with cheaper models
+
+### Model Unavailability
+
+**Scenario:** Claude API is down, GPT-4o is slow
+
+**Fallback Chain:**
+```python
+MODEL_FALLBACK_CHAIN = {
+    "gpt-4o": ["gpt-4o-mini", "claude-3-5-haiku"],
+    "claude-3-5-haiku": ["gpt-4o-mini"],
+    "gpt-4o-mini": []  # No fallback for cheapest
+}
+
+async def generate_with_fallback(query, primary_model):
+    try:
+        return await llm_client.generate(query, model=primary_model)
+    except (TimeoutError, ServiceUnavailable) as e:
+        fallbacks = MODEL_FALLBACK_CHAIN.get(primary_model, [])
+        
+        for fallback_model in fallbacks:
+            try:
+                logger.warning(f"Falling back to {fallback_model}", 
+                             extra={"primary": primary_model, "error": str(e)})
+                return await llm_client.generate(query, model=fallback_model)
+            except Exception:
+                continue
+        
+        # All models failed
+        raise AllModelsUnavailableError("No LLM models available")
+```
+
+### Cost Monitoring Alerts
+
+**Alert Thresholds:**
+- **80% of daily budget:** Warning notification
+- **100% of daily budget:** Enable budget mode, alert team
+- **Unexpected spike:** >2x normal hourly spend
+
+**Implementation:**
+```python
+def check_spending_anomaly(current_hour_spend, historical_avg):
+    if current_hour_spend > historical_avg * 2:
+        alert_ops_team(
+            severity="WARNING",
+            message=f"Spending spike detected: ${current_hour_spend:.2f} (avg: ${historical_avg:.2f})",
+            details={"possible_causes": ["viral_user", "bot_abuse", "bug_in_routing"]}
+        )
+```
+
+---
+
 ## Recommendation
 
 **Start with GPT-4o mini only**, then add multi-model routing after launch when:

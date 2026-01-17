@@ -45,6 +45,200 @@
 
 ---
 
+## Document Ingestion Flow
+
+**How user data becomes searchable in RAG:**
+
+1. User creates task → Node.js saves to PostgreSQL
+2. Node.js calls Python: `POST http://localhost:8000/api/ingest`
+3. Python generates embedding (OpenAI API)
+4. Python stores vector in Qdrant with user_id filter
+5. Document now searchable for future RAG queries
+
+**See [document-ingestion.md](file:///mnt/F/AI-ML/Pixie/documentation/document-ingestion.md) for complete implementation**
+
+---
+
+## Real-Time Response Streaming
+
+**Challenge:** LLM generation takes 1-5 seconds - users expect real-time updates
+
+**Solution:** Server-Sent Events (SSE) from Python to Node.js
+
+### Streaming Flow
+
+```
+User sends message
+    ↓
+Node.js receives via WebSocket
+    ↓
+Node.js calls Python /api/generate-stream (SSE endpoint)
+    ↓
+Python streams LLM tokens as they generate
+    ↓
+Node.js forwards tokens to user via WebSocket (real-time typing)
+    ↓
+Final response includes tool calls for execution
+    ↓
+Node.js executes tools and sends confirmation
+```
+
+### Python SSE Endpoint
+
+```python
+from fastapi.responses import StreamingResponse
+
+@app.post("/api/generate-stream")
+async def generate_stream(request: GenerateRequest):
+    async def event_generator():
+        async for token in llm_client.stream(request.message):
+            yield f"data: {json.dumps({'token': token})}\n\n"
+        
+        # Final response with tool calls
+        yield f"data: {json.dumps({'done': True, 'tool_calls': [...]})}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+```
+
+### Node.js SSE Consumer
+
+```javascript
+const EventSource = require('eventsource');
+
+function streamLLMResponse(userId, message) {
+  const es = new EventSource(`${PYTHON_AI_URL}/api/generate-stream`, {
+    method: 'POST',
+    body: JSON.stringify({ user_id: userId, message }),
+    headers: { 'Content-Type': 'application/json' }
+  });
+  
+  es.on('message', (event) => {
+    const data = JSON.parse(event.data);
+    
+    if (data.token) {
+      // Forward token to user via WebSocket
+      io.to(userId).emit('llm-token', data.token);
+    }
+    
+    if (data.done) {
+      // Execute tool calls and send final response
+      executeToo lCalls(data.tool_calls);
+      es.close();
+    }
+  });
+}
+```
+
+---
+
+## Failure Scenarios
+
+### Python Service Down
+
+**Symptoms:**
+- Connection refused or timeout on HTTP requests
+- Node.js cannot reach Python service
+
+**Handling:**
+
+```javascript
+async function callPythonWithFallback(endpoint, data) {
+  const maxRetries = 3;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await fetch(`${PYTHON_AI_URL}${endpoint}`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+        timeout: 10000  // 10 second timeout
+      });
+      return await response.json();
+    } catch (error) {
+      logger.error(`Python service error (attempt ${i + 1})`, { error });
+      
+      if (i < maxRetries - 1) {
+        await sleep(1000 * (i + 1));  // 1s, 2s, 3s backoff
+        continue;
+      }
+      
+      // All retries failed - return fallback
+      return {
+        response: "I'm temporarily unable to process AI requests. Please try again in a moment.",
+        tool_calls: [],
+        error: "service_unavailable"
+      };
+    }
+  }
+}
+```
+
+**User Experience:**
+- Graceful degradation message
+- User can still access manual task creation
+- Requests queued for later processing (optional)
+
+### Partial LLM Failure
+
+**Scenario:** Primary LLM model fails, but others available
+
+**Handling:**
+- Python service automatically falls back to secondary model
+- See [error-handling-retry.md](file:///mnt/F/AI-ML/Pixie/documentation/error-handling-retry.md) for details
+
+**Node.js doesn't need special handling** - Python manages model fallback internally
+
+### Database Connection Lost
+
+**PostgreSQL Down:**
+- Node.js handles directly (database layer)
+- Return cached data or error message
+- Not Python's concern
+
+**Qdrant Down:**
+- Python RAG search fails
+- Fallback: LLM responds without context
+- User gets response but may be less informed
+
+```python
+async def search_context(user_id, query):
+    try:
+        results = await qdrant_client.search(...)
+        return results
+    except QdrantException:
+        logger.error("Qdrant unavailable", extra={"user_id": user_id})
+        # Return empty context - LLM responds without RAG
+        return []
+```
+
+### Health Check Implementation
+
+**Node.js periodically checks Python health:**
+
+```javascript
+async function checkPythonHealth() {
+  try {
+    const response = await fetch(`${PYTHON_AI_URL}/health`, {
+      timeout: 5000
+    });
+    
+    if (response.ok) {
+      pythonServiceHealthy = true;
+      return true;
+    }
+  } catch (error) {
+    pythonServiceHealthy = false;
+    logger.error('Python service health check failed', { error });
+  }
+  
+  return false;
+}
+
+// Check every 30 seconds
+setInterval(checkPythonHealth, 30000);
+```
+
+---
+
 ## Why Not Full Python?
 
 **Technical trade-offs:**

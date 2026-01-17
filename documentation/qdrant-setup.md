@@ -532,6 +532,276 @@ quantization_config=ScalarQuantization(
 
 ---
 
+## 6. Collection Migrations & Data Management
+
+### Changing Collection Schema
+
+**Scenario:** Need to change vector dimensions or add payload fields
+
+**Migration Strategy:**
+
+**1. Create New Collection**
+```python
+# Create new collection with updated config
+client.create_collection(
+    collection_name="user_documents_v2",
+    vectors_config=VectorParams(
+        size=3072,  # Changed from 1536
+        distance=Distance.COSINE
+    ),
+    hnsw_config=HnswConfigDiff(m=16, ef_construct=128)
+)
+```
+
+**2. Re-index All Documents (Background Job)**
+```python
+import asyncio
+from tqdm import tqdm
+
+async def migrate_collection():
+    """Migrate from old to new collection"""
+    # Get all documents from old collection
+    offset = None
+    batch_size = 100
+    total_migrated = 0
+    
+    while True:
+        # Scroll through old collection
+        results, offset = client.scroll(
+            collection_name="user_documents",
+            limit=batch_size,
+            offset=offset
+        )
+        
+        if not results:
+            break
+        
+        # Re-generate embeddings with new model
+        new_points = []
+        for point in results:
+            # Get original content
+            content = point.payload["content"]
+            
+            # Generate new embedding (new dimension)
+            new_embedding = await generate_embedding_v2(content)
+            
+            new_points.append(PointStruct(
+                id=point.id,
+                vector=new_embedding,
+                payload=point.payload
+            ))
+        
+        # Insert into new collection
+        client.upsert(
+            collection_name="user_documents_v2",
+            points=new_points
+        )
+        
+        total_migrated += len(new_points)
+        print(f"Migrated {total_migrated} documents...")
+        
+        if offset is None:
+            break
+    
+    print(f"Migration complete: {total_migrated} documents")
+```
+
+**3. Atomic Switch**
+```python
+# In your application config
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "user_documents")
+
+# After migration complete, update environment variable
+# QDRANT_COLLECTION=user_documents_v2
+
+# Or use alias for zero-downtime switch
+client.update_collection_aliases(
+    change_aliases_operations=[
+        CreateAliasOperation(
+            create_alias=CreateAlias(
+                collection_name="user_documents_v2",
+                alias_name="user_documents_active"
+            )
+        )
+    ]
+)
+
+# Application uses alias instead of collection name
+results = client.search(
+    collection_name="user_documents_active",  # Points to v2
+    query_vector=embedding
+)
+```
+
+**4. Rollback Plan**
+```python
+# Keep old collection for 7 days
+# If issues found, switch alias back
+client.update_collection_aliases(
+    change_aliases_operations=[
+        CreateAliasOperation(
+            create_alias=CreateAlias(
+                collection_name="user_documents",  # Back to v1
+                alias_name="user_documents_active"
+            )
+        )
+    ]
+)
+
+# After 7 days without issues, delete old collection
+client.delete_collection("user_documents")
+```
+
+### Corrupt Data Handling
+
+**Symptoms:**
+- Search returns no results for existing documents
+- Error: "vector dimension mismatch"
+- Inconsistent search results
+- Missing documents in search
+
+**Diagnosis:**
+```python
+async def diagnose_collection_health(collection_name):
+    """Check for common issues"""
+    issues = []
+    
+    # Get collection info
+    info = client.get_collection(collection_name)
+    expected_dim = info.config.params.vectors.size
+    
+    # Sample check: verify vector dimensions
+    points, _ = client.scroll(
+        collection_name=collection_name,
+        limit=100,
+        with_vectors=True
+    )
+    
+    for point in points:
+        if len(point.vector) != expected_dim:
+            issues.append({
+                "type": "dimension_mismatch",
+                "point_id": point.id,
+                "expected": expected_dim,
+                "actual": len(point.vector)
+            })
+    
+    # Check for null/invalid payloads
+    for point in points:
+        if not point.payload.get("user_id"):
+            issues.append({
+                "type": "missing_user_id",
+                "point_id": point.id
+            })
+    
+    return issues
+```
+
+**Fix: Re-index Corrupt Documents**
+```python
+async def fix_corrupt_documents(issues):
+    """Re-generate embeddings for corrupt documents"""
+    for issue in issues:
+        if issue["type"] == "dimension_mismatch":
+            # Fetch original content from PostgreSQL
+            doc = await db.get_document(issue["point_id"])
+            
+            if doc:
+                # Re-generate embedding
+                embedding = await generate_embedding(doc.content)
+                
+                # Update in Qdrant
+                client.upsert(
+                    collection_name="user_documents",
+                    points=[PointStruct(
+                        id=doc.id,
+                        vector=embedding,
+                        payload={"user_id": doc.user_id, "content": doc.content}
+                    )]
+                )
+                
+                logger.info(f"Fixed corrupt document {issue['point_id']}")
+            else:
+                # Document doesn't exist in PostgreSQL - delete from Qdrant
+                client.delete(
+                    collection_name="user_documents",
+                    points_selector={"points": [issue["point_id"]]}
+                )
+                logger.warning(f"Deleted orphaned document {issue['point_id']}")
+```
+
+**Preventive Validation**
+```python
+async def validate_before_insert(document_id, embedding, payload):
+    """Validate data before inserting to Qdrant"""
+    # Check embedding dimension
+    if len(embedding) != 1536:
+        raise ValueError(f"Invalid embedding dimension: {len(embedding)}")
+    
+    # Check required payload fields
+    required_fields = ["user_id", "content", "document_type"]
+    for field in required_fields:
+        if field not in payload:
+            raise ValueError(f"Missing required field: {field}")
+    
+    # Check for NaN or Inf in embedding
+    if not all(isinstance(x, (int, float)) and not math.isnan(x) and not math.isinf(x) for x in embedding):
+        raise ValueError("Embedding contains NaN or Inf values")
+    
+    return True
+```
+
+### Data Consistency Checks
+
+**Daily Health Check Script**
+```python
+import schedule
+
+async def daily_health_check():
+    """Run daily at 2 AM"""
+    logger.info("Starting daily Qdrant health check")
+    
+    # 1. Check collection size
+    collection_info = client.get_collection("user_documents")
+    point_count = collection_info.points_count
+    
+    # Compare with PostgreSQL
+    db_count = await db.count_documents()
+    
+    if abs(point_count - db_count) > 100:
+        logger.error(f"Collection size mismatch: Qdrant={point_count}, DB={db_count}")
+        await alert_ops_team("Qdrant collection size mismatch")
+    
+    # 2. Diagnose for corrupt data
+    issues = await diagnose_collection_health("user_documents")
+    
+    if issues:
+        logger.warning(f"Found {len(issues)} issues")
+        await fix_corrupt_documents(issues)
+    
+    # 3. Test search functionality
+    test_query = "test query"
+    test_embedding = await generate_embedding(test_query)
+    
+    try:
+        results = client.search(
+            collection_name="user_documents",
+            query_vector=test_embedding,
+            limit=5
+        )
+        logger.info(f"Search test passed: {len(results)} results")
+    except Exception as e:
+        logger.error(f"Search test failed: {e}")
+        await alert_ops_team(f"Qdrant search failure: {e}")
+    
+    logger.info("Daily health check complete")
+
+# Schedule
+schedule.every().day.at("02:00").do(daily_health_check)
+```
+
+---
+
 ## 7. Best Practices Summary
 
 **Index Configuration:**

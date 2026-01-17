@@ -480,7 +480,289 @@ def track_user_analytics(user_id, event_type, metadata=None):
 
 ---
 
-## 6. Logging Best Practices
+## 6. Cross-Service Request Correlation
+
+### Request ID Pattern
+
+**Problem:** Logs scattered across Node.js and Python services
+
+**Solution:** Use shared request ID throughout request lifecycle
+
+**Node.js Implementation:**
+```javascript
+const { v4: uuidv4 } = require('uuid');
+
+// Middleware to generate request ID
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || uuidv4();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
+
+// Include in all logs
+const logger = winston.createLogger({
+  format: winston.format.combine(
+    winston.format.json(),
+    winston.format((info) => {
+      info.request_id = global.currentRequestId;
+      return info;
+    })()
+  )
+});
+
+// Pass to Python service
+async function callPythonService(endpoint, data, requestId) {
+  return fetch(`${PYTHON_URL}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'X-Request-ID': requestId,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(data)
+  });
+}
+```
+
+**Python Implementation:**
+```python
+from fastapi import Request, Response
+import logging
+import contextvars
+
+# Context variable for request ID
+request_id_var = contextvars.ContextVar('request_id', default=None)
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    # Extract or generate request ID
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    
+    # Store in context
+    request_id_var.set(request_id)
+    
+    # Add to response headers
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    
+    return response
+
+# Custom log filter to include request ID
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        record.request_id = request_id_var.get()
+        return True
+
+# Add filter to logger
+logger.addFilter(RequestIdFilter())
+
+# Log format includes request_id
+logging.basicConfig(
+    format='%(asctime)s [%(request_id)s] %(levelname)s: %(message)s'
+)
+```
+
+### Distributed Tracing
+
+**For Complex Flows:**
+```python
+import time
+
+class RequestTracer:
+    def __init__(self, request_id):
+        self.request_id = request_id
+        self.spans = []
+    
+    def start_span(self, operation):
+        span_id = str(uuid.uuid4())
+        self.spans.append({
+            "span_id": span_id,
+            "operation": operation,
+            "start_time": time.time(),
+            "end_time": None
+        })
+        return span_id
+    
+    def end_span(self, span_id):
+        for span in self.spans:
+            if span["span_id"] == span_id:
+                span["end_time"] = time.time()
+                span["duration"] = span["end_time"] - span["start_time"]
+                logger.info(f"Span complete: {span['operation']}", extra=span)
+
+# Usage
+tracer = RequestTracer(request_id)
+
+span1 = tracer.start_span("generate_embedding")
+embedding = await get_embedding(query)
+tracer.end_span(span1)
+
+span2 = tracer.start_span("qdrant_search")
+results = await qdrant_search(embedding)
+tracer.end_span(span2)
+```
+
+### Log Aggregation Query
+
+**Search logs across services:**
+```bash
+# If using centralized logging (e.g., ElasticSearch, Loki)
+
+# Find all logs for a specific request
+request_id="abc-123-def"
+curl -X GET "localhost:9200/logs/_search" -H 'Content-Type: application/json' -d'
+{
+  "query": {
+    "match": {
+      "request_id": "'$request_id'"
+    }
+  },
+  "sort": [{"@timestamp": "asc"}]
+}'
+
+# Shows complete request flow:
+# 1. Node.js receives request
+# 2. Node.js calls Python
+# 3. Python generates embedding
+# 4. Python searches Qdrant
+# 5. Python returns to Node.js
+# 6. Node.js responds to user
+```
+
+---
+
+## 7. Privacy in Logs
+
+### What NOT to Log
+
+**Sensitive Data:**
+- Full user queries (log hash instead)
+- API keys or tokens
+- Complete LLM responses
+- Personal identifiable information (PII)
+- User passwords or credentials
+- Email addresses (use user_id)
+- Payment information
+
+**Safe Logging Approach:**
+```python
+import hashlib
+
+def log_query_safely(user_id, query):
+    """Log query without exposing content"""
+    query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
+    query_length = len(query)
+    query_preview = query[:20] + "..." if len(query) > 20 else query
+    
+    logger.info("Query received", extra={
+        "user_id": user_id,
+        "query_hash": query_hash,  # For deduplication
+        "query_length": query_length,
+        "query_preview": query_preview,  # First 20 chars only
+        "timestamp": datetime.now().isoformat()
+    })
+```
+
+**LLM Response Logging:**
+```python
+def log_llm_response_safely(response, tokens):
+    """Log response metadata without exposing content"""
+    logger.info("LLM response generated", extra={
+        "response_length": len(response),
+        "token_count": tokens,
+        "model": "gpt-4o-mini",
+        "has_tool_calls": "tool_calls" in response,
+        # DO NOT log: "response": response
+    })
+```
+
+### Data Retention Policy
+
+**Log Retention:**
+- Production INFO logs: 30 days
+- ERROR logs: 90 days
+- Security audit logs: 1 year
+- Development logs: 7 days
+
+**Automated Cleanup:**
+```python
+import schedule
+
+def cleanup_old_logs():
+    """Delete logs older than retention period"""
+    retention_days = {
+        "INFO": 30,
+        "WARNING": 60,
+        "ERROR": 90,
+        "CRITICAL": 365
+    }
+    
+    for level, days in retention_days.items():
+        cutoff = datetime.now() - timedelta(days=days)
+        
+        # Delete from database/log store
+        deleted = log_store.delete_where(
+            level=level,
+            timestamp__lt=cutoff
+        )
+        
+        logger.info(f"Deleted {deleted} {level} logs older than {days} days")
+
+# Run weekly
+schedule.every().sunday.at("02:00").do(cleanup_old_logs)
+```
+
+### PII Redaction
+
+**Automatic Redaction:**
+```python
+import re
+
+class PIIRedactor:
+    """Redact PII from logs"""
+    
+    @staticmethod
+    def redact_email(text):
+        return re.sub(
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+            '[EMAIL_REDACTED]',
+            text
+        )
+    
+    @staticmethod
+    def redact_phone(text):
+        return re.sub(
+            r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b',
+            '[PHONE_REDACTED]',
+            text
+        )
+    
+    @staticmethod
+    def redact_api_key(text):
+        return re.sub(
+            r'sk-[a-zA-Z0-9]{20,}',
+            '[API_KEY_REDACTED]',
+            text
+        )
+    
+    @classmethod
+    def redact_all(cls, text):
+        text = cls.redact_email(text)
+        text = cls.redact_phone(text)
+        text = cls.redact_api_key(text)
+        return text
+
+# Use in logging
+class SafeLogFormatter(logging.Formatter):
+    def format(self, record):
+        # Redact PII from message
+        if hasattr(record, 'msg'):
+            record.msg = PIIRedactor.redact_all(str(record.msg))
+        return super().format(record)
+```
+
+---
+
+## 8. Logging Best Practices
 
 ### Log What Matters
 
