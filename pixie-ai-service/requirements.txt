@@ -1,0 +1,32 @@
+# Pixie AI Service - Production Dependencies
+# Python 3.11+
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# LLM Clients
+openai==1.12.0
+anthropic==0.18.0
+
+# Vector Database
+qdrant-client==1.7.0
+
+# PostgreSQL (async, read-only)
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.25
+
+# Redis
+redis==5.0.1
+
+# HTTP Client
+httpx==0.26.0
+
+# Retry Logic
+tenacity==8.2.3
+
+# Utilities
+python-dotenv==1.0.0
+numpy==1.26.3

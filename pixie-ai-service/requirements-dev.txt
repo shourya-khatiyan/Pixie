@@ -1,0 +1,22 @@
+# Pixie AI Service - Development Dependencies
+# Includes all production dependencies plus testing/development tools
+
+-r requirements.txt
+
+# Testing
+pytest==8.0.0
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+
+# Code Quality
+ruff==0.1.14
+mypy==1.8.0
+
+# Type Stubs
+types-redis==4.6.0
+
+# Security Scanning
+pip-audit==2.7.0
+
+# Development Tools
+ipython==8.20.0
